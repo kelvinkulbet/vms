@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Enhanced Multi-VM Manager (KVM-aware, TCG fallback)
-VERSION="1.0-fixed"
+VERSION="1.1-full"
 
 # Helper colors
 RED="\033[1;31m"
@@ -23,7 +23,6 @@ print_status() {
   esac
 }
 
-# Validate simple patterns
 validate_input() {
   local type="$1"; local value="$2"
   case "$type" in
@@ -36,7 +35,6 @@ validate_input() {
   return 0
 }
 
-# Dependencies check (but allow running with TCG if KVM not available)
 check_dependencies() {
   local deps=(wget qemu-img qemu-system-x86_64)
   local miss=()
@@ -48,27 +46,21 @@ check_dependencies() {
 
   if [ ${#miss[@]} -ne 0 ]; then
     print_status "ERROR" "Missing dependencies: ${miss[*]}"
-    print_status "INFO" "On Debian/Ubuntu try: sudo apt update && sudo apt install -y qemu-system-x86 cloud-image-utils wget"
+    print_status "INFO" "On Debian/Ubuntu try: sudo apt install -y qemu-system-x86 cloud-image-utils wget"
     exit 1
   fi
 
-  # cloud-localds is provided by cloud-image-utils, but check presence
   if ! command -v cloud-localds &>/dev/null; then
-    print_status "WARN" "cloud-localds not found. cloud-init seed creation may fail (cloud-image-utils required)."
+    print_status "WARN" "cloud-localds not found. cloud-init seed creation may fail."
   fi
 }
 
-# Cleanup seed files on exit
-cleanup() {
-  : # no-op for now (we leave files), but reserved
-}
+cleanup() { :; }
 trap cleanup EXIT
 
-# Helpers: VM storage dir
 VM_DIR="${VM_DIR:-$HOME/vms}"
 mkdir -p "$VM_DIR"
 
-# OS options
 declare -A OS_OPTIONS=(
   ["Ubuntu 22.04"]="ubuntu|jammy|https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img|ubuntu22|ubuntu|ubuntu"
   ["Ubuntu 24.04"]="ubuntu|noble|https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img|ubuntu24|ubuntu|ubuntu"
@@ -76,25 +68,16 @@ declare -A OS_OPTIONS=(
   ["Debian 12"]="debian|bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2|debian12|debian|debian"
 )
 
-# Get VM list
 get_vm_list() {
   find "$VM_DIR" -maxdepth 1 -name "*.conf" -printf "%f\n" 2>/dev/null | sed 's/\.conf$//' | sort
 }
 
-# Load config
 load_vm_config() {
   local vm_name="$1"
   local conf="$VM_DIR/$vm_name.conf"
-  if [ -f "$conf" ]; then
-    # shellcheck disable=SC1090
-    source "$conf"
-    return 0
-  else
-    return 1
-  fi
+  [ -f "$conf" ] && source "$conf" && return 0 || return 1
 }
 
-# Save config
 save_vm_config() {
   local conf="$VM_DIR/$VM_NAME.conf"
   cat > "$conf" <<EOF
@@ -118,59 +101,35 @@ EOF
   print_status "SUCCESS" "Saved config: $conf"
 }
 
-# Create cloud-init seed (tries cloud-localds, falls back to genisoimage if available)
 create_cloud_seed() {
-  local seed="$1"
-  local userdata="$2"
-  local metadata="$3"
+  local seed="$1"; local userdata="$2"; local metadata="$3"
   if command -v cloud-localds &>/dev/null; then
-    cloud-localds "$seed" "$userdata" "$metadata"
-    return $?
+    cloud-localds "$seed" "$userdata" "$metadata" && return 0
   fi
-
-  # fallback: try mkisofs/genisoimage or genisoimage from cdrkit
   if command -v genisoimage &>/dev/null; then
-    genisoimage -output "$seed" -volid cidata -joliet -rock "$userdata" "$metadata"
-    return $?
+    genisoimage -output "$seed" -volid cidata -joliet -rock "$userdata" "$metadata" && return 0
   elif command -v mkisofs &>/dev/null; then
-    mkisofs -output "$seed" -volid cidata -joliet -rock "$userdata" "$metadata"
-    return $?
-  else
-    return 1
+    mkisofs -output "$seed" -volid cidata -joliet -rock "$userdata" "$metadata" && return 0
   fi
+  return 1
 }
 
-# Setup VM image (download + resize + seed)
 setup_vm_image() {
   print_status "INFO" "Preparing image for $VM_NAME..."
-  mkdir -p "$VM_DIR"
   IMG_FILE="$VM_DIR/$VM_NAME.img"
   SEED_FILE="$VM_DIR/$VM_NAME-seed.iso"
   CREATED="$(date)"
 
   if [ ! -f "$IMG_FILE" ]; then
     print_status "INFO" "Downloading $IMG_URL ..."
-    wget -q --show-progress -O "$IMG_FILE.tmp" "$IMG_URL" || { print_status "ERROR" "Download failed"; return 1; }
+    wget -q --show-progress -O "$IMG_FILE.tmp" "$IMG_URL"
     mv -f "$IMG_FILE.tmp" "$IMG_FILE"
   else
-    print_status "INFO" "Image already exists, skipping download"
+    print_status "INFO" "Image exists, skipping download"
   fi
 
-  # Try resize (qemu-img supports)
-  if ! qemu-img info "$IMG_FILE" &>/dev/null; then
-    print_status "WARN" "Image file invalid or qemu-img can't read it"
-  fi
+  qemu-img resize "$IMG_FILE" "$DISK_SIZE" 2>/dev/null || print_status "WARN" "Resize failed"
 
-  # Attempt to resize; ignore failure but warn
-  if ! qemu-img resize "$IMG_FILE" "$DISK_SIZE" 2>/dev/null; then
-    print_status "WARN" "Resize failed; leaving image as-is or creating new qcow2 overlay"
-    # create overlay instead
-    tmp="$IMG_FILE.overlay"
-    qemu-img create -f qcow2 -b "$IMG_FILE" "$tmp" "$DISK_SIZE" || true
-    if [ -f "$tmp" ]; then mv -f "$tmp" "$IMG_FILE"; fi
-  fi
-
-  # cloud-init user-data/meta-data
   cat > "$VM_DIR/$VM_NAME-user-data" <<EOF
 #cloud-config
 hostname: $HOSTNAME
@@ -193,159 +152,152 @@ instance-id: iid-$VM_NAME
 local-hostname: $HOSTNAME
 EOF
 
-  if ! create_cloud_seed "$SEED_FILE" "$VM_DIR/$VM_NAME-user-data" "$VM_DIR/$VM_NAME-meta-data"; then
-    print_status "ERROR" "Failed to create cloud-init seed. Install cloud-image-utils (provides cloud-localds) or genisoimage/mkisofs."
-    return 1
-  fi
-
+  create_cloud_seed "$SEED_FILE" "$VM_DIR/$VM_NAME-user-data" "$VM_DIR/$VM_NAME-meta-data"
   print_status "SUCCESS" "Image and cloud-init seed ready"
-  return 0
 }
 
-# Start VM (auto-detect KVM)
 start_vm() {
   local vm="$1"
-  if ! load_vm_config "$vm"; then
-    print_status "ERROR" "VM config not found: $vm"
-    return 1
-  fi
-
+  load_vm_config "$vm" || { print_status "ERROR" "VM config not found"; return 1; }
   print_status "INFO" "Starting VM $vm (memory=${MEMORY}MB cpus=${CPUS})"
 
-  # prepare files
-  IMG_FILE="$IMG_FILE"   # already set in config
-  SEED_FILE="$SEED_FILE"
-  if [ ! -f "$IMG_FILE" ]; then
-    print_status "ERROR" "Image missing: $IMG_FILE"
-    return 1
-  fi
-  if [ ! -f "$SEED_FILE" ]; then
-    print_status "WARN" "Seed missing: $SEED_FILE; attempting recreate..."
-    setup_vm_image || return 1
-  fi
-
-  # check KVM
-  ACCEL_OPTS=()
+  local ACCEL_OPTS=()
   if [ -c /dev/kvm ] && [ -w /dev/kvm ]; then
     print_status "INFO" "KVM detected: using hardware acceleration"
     ACCEL_OPTS+=(-enable-kvm -cpu host)
   else
-    print_status "WARN" "KVM not available: falling back to software emulation (TCG)"
-    # ensure we don't pass -enable-kvm
+    print_status "WARN" "KVM not available: using software (TCG)"
     ACCEL_OPTS+=(-accel tcg)
   fi
 
-  # build qemu command
-  net_counter=0
-  qemu_cmd=(qemu-system-x86_64 "${ACCEL_OPTS[@]}" -m "$MEMORY" -smp "$CPUS" \
+  qemu-system-x86_64 "${ACCEL_OPTS[@]}" \
+    -m "$MEMORY" -smp "$CPUS" \
     -drive "file=$IMG_FILE,if=virtio,format=qcow2" \
     -drive "file=$SEED_FILE,if=virtio,format=raw" \
-    -boot order=c)
-
-  # base netdev for ssh
-  qemu_cmd+=(-device virtio-net-pci,netdev=n${net_counter} -netdev "user,id=n${net_counter},hostfwd=tcp::${SSH_PORT}-:22")
-  net_counter=$((net_counter+1))
-
-  # extra port forwards
-  if [ -n "${PORT_FORWARDS:-}" ]; then
-    IFS=',' read -ra forwards <<< "$PORT_FORWARDS"
-    for f in "${forwards[@]}"; do
-      hostp="${f%%:*}"; guestp="${f##*:}"
-      qemu_cmd+=(-device virtio-net-pci,netdev=n${net_counter} -netdev "user,id=n${net_counter},hostfwd=tcp::${hostp}-:${guestp}")
-      net_counter=$((net_counter+1))
-    done
-  fi
-
-  # GUI or headless
-  if [ "${GUI_MODE:-false}" = true ]; then
-    qemu_cmd+=(-vga virtio -display gtk,gl=on)
-  else
-    qemu_cmd+=(-nographic -serial mon:stdio)
-  fi
-
-  # extras
-  qemu_cmd+=(-device virtio-balloon-pci -object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-pci,rng=rng0)
-
-  print_status "INFO" "QEMU command: ${qemu_cmd[*]:0:6} ... (truncated for display)"
-  # run
-  "${qemu_cmd[@]}"
-  print_status "INFO" "QEMU process exited"
+    -device virtio-net-pci,netdev=n0 \
+    -netdev "user,id=n0,hostfwd=tcp::${SSH_PORT}-:22" \
+    -nographic -serial mon:stdio
 }
 
-# Delete VM
 delete_vm() {
   local vm="$1"
-  if ! load_vm_config "$vm"; then
-    print_status "ERROR" "VM config not found: $vm"; return 1
-  fi
-  rm -f "$IMG_FILE" "$SEED_FILE" "$VM_DIR/$vm.conf" "$VM_DIR/$vm-user-data" "$VM_DIR/$vm-meta-data"
-  print_status "SUCCESS" "Deleted VM $vm and its files"
+  load_vm_config "$vm" || { print_status "ERROR" "VM config not found"; return 1; }
+  rm -f "$IMG_FILE" "$SEED_FILE" "$VM_DIR/$vm.conf"
+  print_status "SUCCESS" "Deleted VM $vm"
 }
 
-# Simple menu (trimmed for brevity)
+# ✅ 7) Cek spesifikasi VM
+check_vm_specs() {
+  echo "Available VMs:"
+  mapfile -t vlist < <(get_vm_list)
+  [ ${#vlist[@]} -eq 0 ] && { print_status "INFO" "No VMs found"; return; }
+
+  for idx in "${!vlist[@]}"; do echo " $((idx+1))) ${vlist[$idx]}"; done
+  read -rp "Select VM to inspect: " n
+  n=$((n-1))
+  local vm="${vlist[$n]}"
+
+  load_vm_config "$vm" || { print_status "ERROR" "VM config not found"; return; }
+
+  echo -e "${BLUE}========== VM SPECIFICATIONS ==========${RESET}"
+  echo -e "${GREEN}Name:        ${RESET}${VM_NAME}"
+  echo -e "${GREEN}OS Type:     ${RESET}${OS_TYPE^} (${CODENAME})"
+  echo -e "${GREEN}CPUs:        ${RESET}${CPUS}"
+  echo -e "${GREEN}Memory:      ${RESET}${MEMORY} MB"
+  echo -e "${GREEN}Disk:        ${RESET}${DISK_SIZE}"
+  echo -e "${GREEN}SSH Port:    ${RESET}${SSH_PORT}"
+  echo -e "${GREEN}GUI Mode:    ${RESET}${GUI_MODE}"
+  echo -e "${GREEN}Ports Fwd:   ${RESET}${PORT_FORWARDS:-None}"
+  echo -e "${GREEN}Image Path:  ${RESET}${IMG_FILE}"
+  echo -e "${GREEN}Seed Path:   ${RESET}${SEED_FILE}"
+  echo -e "${GREEN}Created:     ${RESET}${CREATED}"
+  echo -e "${BLUE}=======================================${RESET}"
+}
+
+# ✅ 8) Tes performa VM
+test_vm_performance() {
+  print_status "INFO" "Testing QEMU acceleration capability..."
+  if [ -c /dev/kvm ] && [ -w /dev/kvm ]; then
+    print_status "SUCCESS" "KVM available ✅"
+  else
+    print_status "WARN" "KVM not detected ❌"
+  fi
+
+  print_status "INFO" "Running quick disk benchmark..."
+  start=$(date +%s)
+  dd if=/dev/zero of=/tmp/testspeed.img bs=1M count=100 oflag=dsync 2> /tmp/speed.log || true
+  end=$(date +%s)
+  runtime=$((end - start))
+  speed=$(grep -o '[0-9.]* MB/s' /tmp/speed.log | tail -1)
+
+  echo -e "${BLUE}========== PERFORMANCE REPORT ==========${RESET}"
+  echo -e "${GREEN}Runtime:     ${RESET}${runtime}s"
+  echo -e "${GREEN}Disk Speed:  ${RESET}${speed:-N/A}"
+  if [ -c /dev/kvm ]; then
+    echo -e "${GREEN}Mode:        ${RESET}Hardware (KVM)"
+    echo -e "${GREEN}Performance: ${RESET}⚡ High"
+  else
+    echo -e "${YELLOW}Mode:        ${RESET}Software (TCG)"
+    echo -e "${YELLOW}Performance: ${RESET}⚠️ Moderate"
+  fi
+  echo -e "${BLUE}========================================${RESET}"
+  rm -f /tmp/testspeed.img /tmp/speed.log
+}
+
 main_menu() {
   while true; do
     echo
-    echo "=== Multi-VM Manager (fixed) ==="
-    echo "VM dir: $VM_DIR"
+    echo "=== Multi-VM Manager v${VERSION} ==="
     echo "1) Create VM"
     echo "2) Start VM"
     echo "3) Delete VM"
     echo "4) List VMs"
+    echo "5) Check VM Specs"
+    echo "6) Test Performance"
     echo "0) Exit"
     read -rp "Choice: " ch
     case "$ch" in
-      1)
+      1) # create
         echo "Select OS:"
-        i=1
-        keys=()
-        for k in "${!OS_OPTIONS[@]}"; do
-          echo " $i) $k"; keys[$i]="$k"; i=$((i+1))
-        done
-        read -rp "OS choice number: " oc
+        i=1; keys=()
+        for k in "${!OS_OPTIONS[@]}"; do echo " $i) $k"; keys[$i]="$k"; i=$((i+1)); done
+        read -rp "OS number: " oc
         OS_NAME="${keys[$oc]}"
         IFS='|' read -r OS_TYPE CODENAME IMG_URL DEFAULT_HOSTNAME DEFAULT_USERNAME DEFAULT_PASSWORD <<< "${OS_OPTIONS[$OS_NAME]}"
-        read -rp "VM name (default: $DEFAULT_HOSTNAME): " VM_NAME; VM_NAME="${VM_NAME:-$DEFAULT_HOSTNAME}"
-        read -rp "Hostname (default: $VM_NAME): " HOSTNAME; HOSTNAME="${HOSTNAME:-$VM_NAME}"
-        read -rp "Username (default: $DEFAULT_USERNAME): " USERNAME; USERNAME="${USERNAME:-$DEFAULT_USERNAME}"
-        read -rsp "Password (default provided if empty): " PASSWORD; echo
-        PASSWORD="${PASSWORD:-$DEFAULT_PASSWORD}"
-        read -rp "Disk size (e.g., 20G) [20G]: " DISK_SIZE; DISK_SIZE="${DISK_SIZE:-20G}"
+        read -rp "VM name [$DEFAULT_HOSTNAME]: " VM_NAME; VM_NAME="${VM_NAME:-$DEFAULT_HOSTNAME}"
+        read -rp "Hostname [$VM_NAME]: " HOSTNAME; HOSTNAME="${HOSTNAME:-$VM_NAME}"
+        read -rp "Username [$DEFAULT_USERNAME]: " USERNAME; USERNAME="${USERNAME:-$DEFAULT_USERNAME}"
+        read -rsp "Password [default]: " PASSWORD; echo; PASSWORD="${PASSWORD:-$DEFAULT_PASSWORD}"
+        read -rp "Disk size [20G]: " DISK_SIZE; DISK_SIZE="${DISK_SIZE:-20G}"
         read -rp "Memory MB [2048]: " MEMORY; MEMORY="${MEMORY:-2048}"
         read -rp "CPUs [2]: " CPUS; CPUS="${CPUS:-2}"
         read -rp "SSH port [2222]: " SSH_PORT; SSH_PORT="${SSH_PORT:-2222}"
-        read -rp "Enable GUI? (y/N): " gui; GUI_MODE=false
-        if [[ "$gui" =~ ^[Yy]$ ]]; then GUI_MODE=true; fi
-        read -rp "Extra port forwards (host:guest,comma separated) or empty: " PORT_FORWARDS
-        IMG_FILE="$VM_DIR/$VM_NAME.img"; SEED_FILE="$VM_DIR/$VM_NAME-seed.iso"; CREATED="$(date)"
+        read -rp "Enable GUI? (y/N): " gui; GUI_MODE=false; [[ "$gui" =~ ^[Yy]$ ]] && GUI_MODE=true
+        read -rp "Extra port forwards (host:guest,comma): " PORT_FORWARDS
         setup_vm_image
         save_vm_config
         ;;
       2)
-        echo "Available VMs:"
         mapfile -t vlist < <(get_vm_list)
-        if [ ${#vlist[@]} -eq 0 ]; then print_status "INFO" "No VMs found"; continue; fi
-        for idx in "${!vlist[@]}"; do echo " $((idx+1))) ${vlist[$idx]}"; done
-        read -rp "Pick number to start: " n; n=$((n-1))
+        [ ${#vlist[@]} -eq 0 ] && { print_status "INFO" "No VMs found"; continue; }
+        for i in "${!vlist[@]}"; do echo " $((i+1))) ${vlist[$i]}"; done
+        read -rp "Pick to start: " n; n=$((n-1))
         start_vm "${vlist[$n]}"
         ;;
       3)
-        echo "Available VMs:"
         mapfile -t vlist < <(get_vm_list)
-        for idx in "${!vlist[@]}"; do echo " $((idx+1))) ${vlist[$idx]}"; done
-        read -rp "Pick number to delete: " n; n=$((n-1))
+        for i in "${!vlist[@]}"; do echo " $((i+1))) ${vlist[$i]}"; done
+        read -rp "Pick to delete: " n; n=$((n-1))
         delete_vm "${vlist[$n]}"
         ;;
-      4)
-        mapfile -t vlist < <(get_vm_list)
-        if [ ${#vlist[@]} -eq 0 ]; then echo "No VMs"; else for v in "${vlist[@]}"; do echo "- $v"; done; fi
-        ;;
+      4) mapfile -t vlist < <(get_vm_list); for v in "${vlist[@]}"; do echo "- $v"; done ;;
+      5) check_vm_specs ;;
+      6) test_vm_performance ;;
       0) exit 0 ;;
       *) echo "Invalid" ;;
     esac
   done
 }
 
-# Start
 check_dependencies
 main_menu
