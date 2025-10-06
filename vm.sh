@@ -107,40 +107,22 @@ print_status "SUCCESS" "KVM is available and accessible"
 return 0
 }
 
-# Function to generate password hash with fallback methods
+# Function to generate simple password hash (no OpenSSL)
 generate_password_hash() {
 local password="$1"
-local hash_method=""
 
-# Try openssl first (preferred method)
-if command -v openssl &> /dev/null; then
-    hash_method=$(openssl passwd -6 "$PASSWORD" 2>/dev/null | tr -d '\n')
-    if [ $? -eq 0 ] && [ -n "$hash_method" ]; then
-        echo "$hash_method"
-        return 0
-    fi
-fi
-
-# Try python3 as second option
+# Try using python3 if available
 if command -v python3 &> /dev/null; then
-    hash_method=$(python3 -c "import crypt; print(crypt.crypt('$password', crypt.mksalt(crypt.METHOD_SHA512)))" 2>/dev/null | tr -d '\n')
-    if [ $? -eq 0 ] && [ -n "$hash_method" ]; then
-        echo "$hash_method"
-        return 0
-    fi
+    python3 -c "import crypt; print(crypt.crypt('$password'))" 2>/dev/null | tr -d '\n' && return 0
 fi
 
-# Try mkpasswd as third option
+# Try using mkpasswd if available
 if command -v mkpasswd &> /dev/null; then
-    hash_method=$(mkpasswd -m sha-512 "$password" 2>/dev/null | tr -d '\n')
-    if [ $? -eq 0 ] && [ -n "$hash_method" ]; then
-        echo "$hash_method"
-        return 0
-    fi
+    mkpasswd "$password" 2>/dev/null | tr -d '\n' && return 0
 fi
 
-# Last resort: use plain text with warning
-print_status "WARN" "No password hashing tool available. Password will be stored in plain text."
+# Fallback to plain text with warning
+print_status "WARN" "No password hashing available, using plain text"
 echo "$password"
 }
 
@@ -148,8 +130,6 @@ echo "$password"
 check_dependencies() {
 local deps=("qemu-system-x86_64" "wget" "cloud-localds" "qemu-img")
 local missing_deps=()
-local optional_deps=("openssl")
-local missing_optional=()
 
 for dep in "${deps[@]}"; do
     if ! command -v "$dep" &> /dev/null; then
@@ -157,21 +137,10 @@ for dep in "${deps[@]}"; do
     fi
 done
 
-for dep in "${optional_deps[@]}"; do
-    if ! command -v "$dep" &> /dev/null; then
-        missing_optional+=("$dep")
-    fi
-done
-
 if [ ${#missing_deps[@]} -ne 0 ]; then
-    print_status "ERROR" "Missing required dependencies: ${missing_deps[*]}"
+    print_status "ERROR" "Missing dependencies: ${missing_deps[*]}"
     print_status "INFO" "On Ubuntu/Debian, try: sudo apt install qemu-system qemu-utils cloud-image-utils wget"
     exit 1
-fi
-
-if [ ${#missing_optional[@]} -ne 0 ]; then
-    print_status "WARN" "Missing optional dependencies: ${missing_optional[*]}"
-    print_status "INFO" "For better security, consider installing: sudo apt install ${missing_optional[*]}"
 fi
 
 # Check KVM availability
@@ -405,7 +374,7 @@ fi
 local new_size=$(qemu-img info "$IMG_FILE" | grep "virtual size" | awk '{print $3}' | tr -d ',')
 print_status "INFO" "New disk size: $new_size"
 
-# Generate password hash using our fallback function
+# Generate password hash using our simple function
 local password_hash=$(generate_password_hash "$PASSWORD")
 
 # cloud-init configuration
